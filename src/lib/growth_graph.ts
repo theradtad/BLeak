@@ -150,6 +150,122 @@ function hash(parent: Node, edge: Edge): string | number {
     return edge.indexOrName;
   }
 }
+/**
+ * PropagateGrowthNew
+* @param oldG The old heap graph.
+ * @param oldGrowth Growth bits for the nodes in the old heap graph.
+ * @param newG The new heap graph.
+ * @param newGrowth Growth bits for the nodes in the new heap graph.
+*/
+function propagateGrowthNew(oldG: HeapGraph, oldGrowth: TwoBitArray, newG: HeapGraph, newGrowth: TwoBitArray): void {
+  let flag = 0;
+  const numNewNodes = newG.nodeCount;
+  let index = 0;
+  // We visit each new node at most once, forming an upper bound on the queue length.
+  // Pre-allocate for better performance.
+  let queue = new Uint32Array(numNewNodes << 1);
+  // Stores the length of queue.
+  let queueLength = 0;
+  // Only store visit bits for the new graph.
+  const visitBits = new OneBitArray(numNewNodes);
+
+  // Enqueues the given node pairing (represented by their indices in their respective graphs)
+  // into the queue. oldNodeIndex and newNodeIndex represent a node at the same edge shared between
+  // the graphs.
+  function enqueue(oldNodeIndex: NodeIndex, newNodeIndex: NodeIndex): void {
+    queue[queueLength++] = oldNodeIndex;
+    queue[queueLength++] = newNodeIndex;
+  }
+
+  // Returns a single item from the queue. (Called twice to remove a pair.)
+  function dequeue(): NodeIndex {
+    return queue[index++] as NodeIndex;
+  }
+
+  // 0 indicates the root node. Start at the root.
+  const oldNode = new Node(0 as NodeIndex, oldG);
+  const newNode = new Node(0 as NodeIndex, newG);
+  const oldEdgeTmp = new Edge(0 as EdgeIndex, oldG);
+
+  {
+    // Visit global roots by *node name*, not *edge name* as edges are arbitrarily numbered from the root node.
+    // These global roots correspond to different JavaScript contexts (e.g. IFrames).
+    const newUserRoots = newG.getGlobalRootIndices();
+    const oldUserRoots = oldG.getGlobalRootIndices();
+    const m = new Map<string, {o: number[], n: number[]}>();
+    for (let i = 0; i < newUserRoots.length; i++) {
+      newNode.nodeIndex = <any> newUserRoots[i];
+      const name = newNode.name;
+      let a = m.get(name);
+      if (!a) {
+        a = {o: [], n: []};
+        m.set(name, a);
+      }
+      a.n.push(newUserRoots[i]);
+    }
+    for (let i = 0; i < oldUserRoots.length; i++) {
+      oldNode.nodeIndex = <any> oldUserRoots[i];
+      const name = oldNode.name;
+      let a = m.get(name);
+      if (a) {
+        a.o.push(oldUserRoots[i]);
+      }
+    }
+
+    m.forEach((v) => {
+      let num = Math.min(v.o.length, v.n.length);
+      for (let i = 0; i < num; i++) {
+        enqueue(<any> v.o[i], <any> v.n[i]);
+        visitBits.set(v.n[i], true);
+      }
+    });
+  }
+
+  // The main loop, which is the essence of PropagateGrowth.
+  while (index < queueLength) {
+    const oldIndex = dequeue();
+    const newIndex = dequeue();
+    oldNode.nodeIndex = oldIndex;
+    newNode.nodeIndex = newIndex;
+
+    // Nodes are either 'New', 'Equal', 'Growing', 'Not Growing'
+    // Nodes begin as 'New', and transition to 'Equal', 'Growing', 'Not Growing' after a snapshot.
+    // So if a node is neither growing nor equal, we don't care about it.
+    
+    if (oldNode.numProperties() < newNode.numProperties()) {
+      newGrowth.set(newIndex, GrowthStatus.GROWING);
+      flag = 1;
+    }
+
+    else if (oldNode.numProperties() == newNode.numProperties()) {
+      newGrowth.set(newIndex, GrowthStatus.EQUAL);
+    }
+
+    // Visit shared children.
+    const oldEdges = new Map<string | number, EdgeIndex>();
+    if (oldNode.hasChildren) {
+      for (const it = oldNode.children; it.hasNext(); it.next()) {
+        const oldChildEdge = it.item();
+        oldEdges.set(hash(oldNode, oldChildEdge), oldChildEdge.edgeIndex);
+      }
+    }
+
+    if (newNode.hasChildren) {
+      for (const it = newNode.children; it.hasNext(); it.next()) {
+        const newChildEdge = it.item();
+        const oldEdge = oldEdges.get(hash(newNode, newChildEdge));
+        oldEdgeTmp.edgeIndex = oldEdge;
+        if (oldEdge !== undefined && !visitBits.get(newChildEdge.toIndex) &&
+            shouldTraverse(oldEdgeTmp, false) && shouldTraverse(newChildEdge, false)) {
+          visitBits.set(newChildEdge.toIndex, true);
+          enqueue(oldEdgeTmp.toIndex, newChildEdge.toIndex);
+        }
+      }
+    }
+  }
+  
+  return flag;
+}
 
 /**
  * PropagateGrowth (Figure 4 in the paper).
@@ -270,6 +386,8 @@ function propagateGrowth(oldG: HeapGraph, oldGrowth: TwoBitArray, newG: HeapGrap
 export class HeapGrowthTracker {
   private _stringMap: StringMap = new StringMap();
   private _heap: HeapGraph = null;
+  private _irreg_heap: HeapGraph =null;    //Change:- irregular leak heap graph
+  private _irreg_growthStatus: TwoBitArray = null;  //Change:- growth status for irregular heap graph  
   private _growthStatus: TwoBitArray = null;
   // DEBUG INFO; this information is shown in a heap explorer tool.
   public _leakRefs: Uint16Array = null;
@@ -278,24 +396,54 @@ export class HeapGrowthTracker {
   public async addSnapshot(parser: HeapSnapshotParser, log: Log): Promise<void> {
     const heap = await HeapGraph.Construct(parser, log, this._stringMap);
     const growthStatus = new TwoBitArray(heap.nodeCount);
+    
+    /*Change :- to store irreg heap graph*/
+    const irreg_heap = heap;
+    const irreg_growthStatus = new TwoBitArray(heap.nodeCount);
+    let flag = 0;
+    
     if (this._heap !== null) {
       log.timeEvent(OperationType.PROPAGATE_GROWTH, () => {
         // Initialize all new nodes to 'NOT_GROWING'.
         // We only want to consider stable heap paths present from the first snapshot.
         growthStatus.fill(GrowthStatus.NOT_GROWING);
         // Merge graphs.
-        propagateGrowth(this._heap, this._growthStatus, heap, growthStatus);
+        flag = propagateGrowthNew(this._heap, this._growthStatus, heap, growthStatus);  //Change:- propagateGrowthNew returns a value
       });
+      /*
+      Change:- to call old propagate growth on the 1st increasing and second increasing graph for irregular leaks
+      */ 
+      if((flag) && (this._irreg_heap === null)){
+        this._irreg_heap = heap;
+        this._irreg_growthStatus = growthStatus;
+      }
+      else if((flag) && (this._irreg_heap !== null)){
+        log.timeEvent(OperationType.PROPAGATE_GROWTH, () => {
+            // Initialize all new nodes to 'NOT_GROWING'.
+            // We only want to consider stable heap paths present from the first snapshot.
+            irreg_growthStatus.fill(GrowthStatus.NOT_GROWING);
+            // Merge graphs.
+            propagateGrowth(this._irreg_heap, this._irreg_growthStatus, irreg_heap, irreg_growthStatus);  
+          });
+        this._irreg_heap = irreg_heap;
+        this._irreg_growthStatus = irreg_growthStatus;  
+      }
     }
     // Keep new graph.
     this._heap = heap;
     this._growthStatus = growthStatus;
   }
-
   public getGraph(): HeapGraph {
     return this._heap;
   }
-
+  
+  /*
+  Assigns irreg_heap to _heap and same for the growth status
+  */
+  public assign_irreg() {
+    this._heap=this._irreg_heap;
+    this._growthStatus=this._irreg_growthStatus;
+  }
   /**
    * Implements FindLeakPaths (Figure 5 in the paper) and CalculateLeakShare (Figure 6 in the paper),
    * as well as calculations for Retained Size and Transitive Closure Size (which we compare against in the paper).
