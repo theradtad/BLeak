@@ -157,7 +157,7 @@ function hash(parent: Node, edge: Edge): string | number {
  * @param newG The new heap graph.
  * @param newGrowth Growth bits for the nodes in the new heap graph.
 */
-function propagateGrowthNew(oldG: HeapGraph, oldGrowth: TwoBitArray, newG: HeapGraph, newGrowth: TwoBitArray): void {
+function propagateGrowthNew(oldG: HeapGraph, oldGrowth: TwoBitArray, newG: HeapGraph, newGrowth: TwoBitArray): number {
   let flag = 0;
   const numNewNodes = newG.nodeCount;
   let index = 0;
